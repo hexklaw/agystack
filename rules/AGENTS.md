@@ -17,6 +17,13 @@ Mirroring pstack in Cursor, enforce strict separation between coordination and c
    - **High-volume exploration sweeps and test matrices (`/swarm`):** Offload large payload reads to subagents to guard the main context window.
    - **Blinded behavioral evaluations (`/eval`):** Run candidate attempts through blinded subagents.
    - **Cross-model decision audits (`/show-me-your-work`):** Dispatch an independent subagent on a different model family to audit the decision log.
+   - **Fan-Out Concurrency Cap (Max 2 Subagents):** Whenever invoking subagents (`invoke_subagent`), you MUST cap parallel fan-out to a maximum of 2 concurrent subagents per skill invocation, regardless of defaults in individual skill instructions:
+     - **`how`**: Limit to at most 2 parallel exploration slices (Step 2a).
+     - **`why`**: Query at most the 2 highest-priority available evidence categories concurrently.
+     - **`reflect`**: Spawn at most 2 reviewer subagents instead of 3.
+     - **`swarm`**: Restrict total concurrent workers to N <= 2 per wave.
+     - **`maintain-verification-skill`**: Run feature audits in batches of at most 2 concurrent workers.
+     - **`arena` / `interrogate` / `architect`**: Limit runners and reviewers to 2 (governed by `agystack-models.md`).
 3. **Candidate Integration Invariant:** Parallel candidate diffs from swarms, arenas, or subagent fan-outs must never be bulk-merged. The coordinator must evaluate candidate branches in isolation, rank them by delta, and graft winning modifications sequentially—verifying and benchmarking each change independently before attempting the next (`principle-sequence-verifiable-units`).
 4. **Subagent Reactive Wakeup and Watchdog Timeout Invariant:** Antigravity subagents run asynchronously in isolated background sessions. They do NOT stream chat text to the coordinator and will ONLY wake the parent when they explicitly invoke `send_message`.
    - **Mechanical Turn Yielding:** Immediately after dispatching local subagents via `invoke_subagent`, the coordinator MUST yield the turn by outputting a progress message with ZERO tool calls (`tool_calls: []`).

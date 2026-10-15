@@ -17,11 +17,11 @@ why investigators: flash
 why synthesizer: inherit
 reflect tooling: inherit
 reflect judgment, divergent, synthesizer: inherit
-arena runners: inherit, flash, pro
-arena cross-judge pool: inherit, flash, pro
+arena runners: inherit, flash
+arena cross-judge pool: inherit, flash
 swarm workers: flash
-architect runners: inherit, flash, pro
-interrogate reviewers: inherit, flash, pro
+architect runners: inherit, flash
+interrogate reviewers: inherit, flash
 
 
 
