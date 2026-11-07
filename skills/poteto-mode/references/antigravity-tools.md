@@ -175,21 +175,35 @@ Antigravity subagents use native `invoke_subagent` model tiers. Model tiers (`in
 | Deep judgment, prose, architecture | `inherit` or `pro` |
 | Multi-model review panels | Diverse combination across `inherit`, `flash`, and `pro` |
 
-Read per-role overrides from `~/.gemini/config/plugins/agystack/rules/agystack-models.md` (or `.agents/plugins/agystack/rules/agystack-models.md`). If a line is missing, use the defaults above.
+Read per-role overrides from `~/.gemini/config/plugins/agystack/agystack-models.md` (or `.agents/plugins/agystack/agystack-models.md`). If a line is missing, use the defaults above.
 
 Keep panels diverse across available tiers (`inherit`, `flash`, `pro`). One subagent runs per list entry.
 
-## Antigravity `/boost` vs agystack Multi-Agent Workflows
+## Antigravity Slash Commands & Multi-Agent Capabilities
 
-`/boost` is Antigravity's native single-agent thinking enhancer, allocating increased inference compute budget for in-context reasoning within a single session.
+### User-Facing Slash Commands vs Programmatic Primitives
 
-agystack skills (`/interrogate`, `/arena`, `/architect`, `/swarm`) are multi-agent engineering workflows. They orchestrate independent subagents across isolated context windows, diverse model tiers, and segregated workspaces with automated verification and synthesis.
+There is a strict boundary between user-facing slash commands and programmatic agent tool primitives:
+- **User-Facing Slash Commands (`/boost`, `/teamwork-preview`, `/interrogate`, etc.)**: UI shortcuts entered directly by human users into the Antigravity chat prompt. Agents cannot execute slash commands as tool calls; agents recommend or suggest that the user invoke slash commands when appropriate, or initiate the underlying programmatic workflows.
+- **Programmatic Primitives (`invoke_subagent`, `run_command`, `schedule`, `ask_question`)**: Callable tool primitives executed by agents within tool execution turns. Automated multi-agent workflows, code reviews, and background tasks are implemented programmatically using these tools.
+
+### `/boost`
+
+`/boost` is Antigravity's multi-agent reasoning pipeline for deep thinking, strategic planning, multiple perspectives, and rigorous verification. It dynamically orchestrates specialized reasoning stages and verification passes to tackle complex architectural questions and pressure-test solutions before implementation.
+
+### `/teamwork-preview`
+
+`/teamwork-preview` is Antigravity's platform capability for collaborative agent teams working together on large projects with autonomous specialist roles. It coordinates multiple agents operating in parallel across distinct functional specializations (such as design, implementation, testing, and review) to drive multi-phase efforts to completion.
+
+### agystack Skills vs Native Platform Modes
+
+agystack skills (`/interrogate`, `/arena`, `/architect`, `/swarm`) build directly on Antigravity's programmatic primitives (`invoke_subagent`, `run_command`, `schedule`, artifacts). They orchestrate independent subagents across isolated context windows, diverse model tiers (`pro`, `flash`, `inherit`), and segregated workspaces with automated verification and synthesis.
 
 ## Paths
 
 | Artifact / Config | Antigravity Path |
 | --- | --- |
-| Role models configuration | `~/.gemini/config/plugins/agystack/rules/agystack-models.md` |
+| Role models configuration | `~/.gemini/config/plugins/agystack/agystack-models.md` |
 | Runtime execution config | `~/.gemini/config/plugins/agystack/agystack-runtime.json` |
 | Agent conversation transcripts | `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl` (discovered across `~/.gemini/antigravity/brain/` and `~/.gemini/antigravity-ide/brain/`) |
 | Session artifacts | `<appDataDir>/brain/<conversation-id>/` |

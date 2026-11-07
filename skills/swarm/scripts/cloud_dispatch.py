@@ -23,6 +23,39 @@ try:
 except ImportError:
     StorageMessenger = None
 
+try:
+    from worker.partner_engine import PARTNER_MODEL_ALIASES, is_partner_model
+except ImportError:
+    try:
+        from skills.swarm.scripts.worker.partner_engine import PARTNER_MODEL_ALIASES, is_partner_model
+    except ImportError:
+        is_partner_model = None
+        PARTNER_MODEL_ALIASES = {}
+
+try:
+    from worker.execution import LIMIT_ENV, TERMINAL_STATES, resolve_execution_limits
+except ImportError:
+    from skills.swarm.scripts.worker.execution import LIMIT_ENV, TERMINAL_STATES, resolve_execution_limits
+
+
+TIER3_DEDICATED_MODELS = {
+    "glm-5-3-flash",
+    "glm-5.3-flash",
+    "glm-5.3",
+    "llama-3.3-70b",
+    "llama-3.3-70b-instruct",
+    "llama-3.3",
+}
+DEEPSEEK_CANONICAL_ALIASES = {
+    "deepseek",
+    "deepseek-flash",
+    "deepseek-4.1",
+    "deepseek-v4.1",
+    "deepseek-4.1-flash",
+    "deepseek-v4.1-flash-maas",
+    "deepseek-v4.1-flash-maas@001",
+}
+
 
 def find_runtime_config() -> Optional[Dict[str, Any]]:
     paths_to_check = [
@@ -343,6 +376,14 @@ def parse_worker_logs(log_output: str) -> List[Dict[str, Any]]:
     for line in log_output.splitlines():
         trimmed = line.strip()
         if trimmed.startswith("[STATUS:"):
+            if not current_status and current_evidence:
+                current_status = trimmed.split("[STATUS:")[1].split("]")[0].strip()
+                _flush()
+                current_status = ""
+                current_evidence = []
+                current_summary = []
+                mode = None
+                continue
             _flush()
             current_status = trimmed.split("[STATUS:")[1].split("]")[0].strip()
             current_evidence = []
@@ -364,20 +405,100 @@ def parse_worker_logs(log_output: str) -> List[Dict[str, Any]]:
     return results
 
 
-MILESTONE_REGEX = re.compile(
-    r"\[MILESTONE\]\s+\[TASK\s+(\d+)\]\s+\[PHASE:\s*([^\]]+)\](?:\s+(.*))?"
-)
+try:
+    from transcript_projector import (
+        TELEMETRY_REGEX,
+        ShadowTranscriptProjector,
+        cleanup_session,
+        format_conversation_url,
+        get_task_brain_dir,
+        get_task_conversation_id,
+        initialize_shadow_transcript,
+        is_telemetry_line,
+        parse_telemetry_line,
+        resolve_app_data_dir,
+    )
+except ImportError:
+    from skills.swarm.scripts.transcript_projector import (
+        TELEMETRY_REGEX,
+        ShadowTranscriptProjector,
+        cleanup_session,
+        format_conversation_url,
+        get_task_brain_dir,
+        get_task_conversation_id,
+        initialize_shadow_transcript,
+        is_telemetry_line,
+        parse_telemetry_line,
+        resolve_app_data_dir,
+    )
 
+try:
+    from swarm_dashboard import (
+        MILESTONE_REGEX,
+        STATUS_BADGES,
+        SwarmDashboardWriter,
+        TaskDashboardState,
+        colorize,
+        format_cloud_logging_url,
+        format_cloud_run_execution_url,
+        format_cloud_run_url,
+        format_elapsed_time,
+        format_gcs_console_url,
+        format_gcs_url,
+        format_log_viewer_url,
+        format_monitored_line,
+        format_status_badge,
+        format_tool_snippet,
+        parse_milestone_log,
+    )
+except ImportError:
+    from skills.swarm.scripts.swarm_dashboard import (
+        MILESTONE_REGEX,
+        STATUS_BADGES,
+        SwarmDashboardWriter,
+        TaskDashboardState,
+        colorize,
+        format_cloud_logging_url,
+        format_cloud_run_execution_url,
+        format_cloud_run_url,
+        format_elapsed_time,
+        format_gcs_console_url,
+        format_gcs_url,
+        format_log_viewer_url,
+        format_monitored_line,
+        format_status_badge,
+        format_tool_snippet,
+        parse_milestone_log,
+    )
 
-def parse_milestone_log(line: str) -> Optional[Dict[str, str]]:
-    m = MILESTONE_REGEX.search(line)
-    if not m:
-        return None
-    return {
-        "task_index": m.group(1),
-        "phase": m.group(2).strip(),
-        "detail": m.group(3).strip() if m.group(3) else "",
-    }
+__all__ = [
+    "TELEMETRY_REGEX",
+    "ShadowTranscriptProjector",
+    "cleanup_session",
+    "format_conversation_url",
+    "get_task_brain_dir",
+    "get_task_conversation_id",
+    "initialize_shadow_transcript",
+    "is_telemetry_line",
+    "parse_telemetry_line",
+    "resolve_app_data_dir",
+    "STATUS_BADGES",
+    "MILESTONE_REGEX",
+    "SwarmDashboardWriter",
+    "TaskDashboardState",
+    "colorize",
+    "format_cloud_logging_url",
+    "format_cloud_run_execution_url",
+    "format_cloud_run_url",
+    "format_elapsed_time",
+    "format_gcs_console_url",
+    "format_gcs_url",
+    "format_log_viewer_url",
+    "format_monitored_line",
+    "format_status_badge",
+    "format_tool_snippet",
+    "parse_milestone_log",
+]
 
 
 class MonitorResult(tuple):
@@ -459,50 +580,61 @@ def recover_session_id_from_execution(
         return None
 
 
-def format_monitored_line(line_str: str, use_color: Optional[bool] = None) -> str:
-    """Format a monitored Cloud Run log line with alert banners and terminal styling."""
-    if use_color is None:
-        use_color = (
-            sys.stdout.isatty()
-            and not os.environ.get("NO_COLOR")
-            and os.environ.get("TERM") != "dumb"
-        )
+def _process_log_entries(
+    stdout: str,
+    seen_log_entries: Set[str],
+    last_seen_timestamp: Optional[str],
+    dashboard_writer: Optional[Any] = None,
+    projector: Optional[Any] = None,
+    print_lines: bool = True,
+) -> Optional[str]:
+    """Parse JSON or text log lines, update last_seen_timestamp, deduplicate, and dispatch."""
+    if not stdout:
+        return last_seen_timestamp
 
-    is_alarm = line_str.startswith("[ALARM]")
-    is_loop_milestone = line_str.startswith("[MILESTONE]") and "[PHASE: POTENTIAL_LOOP]" in line_str
-    if is_alarm:
-        content = line_str[len("[ALARM]"):].strip()
-        if content.startswith(">>>") and content.endswith("<<<"):
-            banner = f"[ALARM] {content}"
-        elif content:
-            banner = f"[ALARM] >>> {content} <<<"
-        else:
-            banner = "[ALARM]"
-        return f"\033[91;1m{banner}\033[0m" if use_color else banner
+    entries = []
+    try:
+        parsed = json.loads(stdout)
+        if isinstance(parsed, list):
+            entries = parsed
+        elif isinstance(parsed, dict):
+            entries = [parsed]
+    except Exception:
+        for line in stdout.splitlines():
+            if line.strip():
+                entries.append({"textPayload": line.strip()})
 
-    if is_loop_milestone:
-        banner = f"[ALARM] >>> {line_str} <<<"
-        return f"\033[91;1m{banner}\033[0m" if use_color else banner
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        ts = entry.get("timestamp")
+        if ts and isinstance(ts, str):
+            if last_seen_timestamp is None or ts > last_seen_timestamp:
+                last_seen_timestamp = ts
 
-    is_waiting = (
-        line_str.startswith("[WAITING_FOR_ORCHESTRATOR]")
-        or line_str.startswith("WAITING_FOR_ORCHESTRATOR")
-        or bool(re.match(r"^\[TASK\s+\d+\]\s+WAITING_FOR_ORCHESTRATOR\b", line_str))
-    )
-    if is_waiting:
-        if line_str.startswith("[WAITING_FOR_ORCHESTRATOR]"):
-            content = line_str[len("[WAITING_FOR_ORCHESTRATOR]"):].strip()
-            if content.startswith(">>>") and content.endswith("<<<"):
-                banner = line_str
-            elif content:
-                banner = f"[WAITING_FOR_ORCHESTRATOR] >>> {content} <<<"
+        raw_payload = entry.get("textPayload") or ""
+        insert_id = entry.get("insertId")
+        dedup_key = insert_id if insert_id else f"{ts or ''}:{raw_payload.strip()}"
+        if dedup_key in seen_log_entries:
+            continue
+        seen_log_entries.add(dedup_key)
+
+        for line in raw_payload.splitlines():
+            line_str = line.strip()
+            if not line_str:
+                continue
+            if is_telemetry_line(line_str):
+                if projector:
+                    projector.process_log_line(line_str)
+                if dashboard_writer:
+                    dashboard_writer.process_log_line(line_str)
             else:
-                banner = "[WAITING_FOR_ORCHESTRATOR]"
-        else:
-            banner = f"[WAITING_FOR_ORCHESTRATOR] >>> {line_str} <<<"
-        return f"\033[93;1m{banner}\033[0m" if use_color else banner
+                if dashboard_writer:
+                    dashboard_writer.process_log_line(line_str)
+                if print_lines:
+                    print(format_monitored_line(line_str), flush=True)
 
-    return line_str
+    return last_seen_timestamp
 
 
 def monitor_execution(
@@ -512,8 +644,12 @@ def monitor_execution(
     task_count: int,
     poll_interval: float = 4,
     timeout: float = 2700.0,
+    projector: Optional[Any] = None,
+    session_id: Optional[str] = None,
+    dashboard_writer: Optional["SwarmDashboardWriter"] = None,
 ) -> MonitorResult:
-    seen_log_entries = set()
+    seen_log_entries: Set[str] = set()
+    last_seen_timestamp: Optional[str] = None
     last_counts = None
     desc_data: Optional[Dict[str, Any]] = None
     execution_succeeded = False
@@ -553,14 +689,16 @@ def monitor_execution(
             desc_data = json.loads(res.stdout)
             status = desc_data.get("status", {}) if isinstance(desc_data, dict) else {}
 
-            log_filter = f'labels."run.googleapis.com/execution_name"="{execution_name}" AND (textPayload:"[MILESTONE]" OR textPayload:"[STATUS:" OR textPayload:"[ALARM]")'
+            log_filter = f'labels."run.googleapis.com/execution_name"="{execution_name}" AND (textPayload:"[MILESTONE]" OR textPayload:"[STATUS:" OR textPayload:"[ALARM]" OR textPayload:"[TELEMETRY]")'
+            if last_seen_timestamp:
+                log_filter += f' AND timestamp > "{last_seen_timestamp}"'
             log_cmd = [
                 "gcloud",
                 "logging",
                 "read",
                 log_filter,
                 "--limit=1000",
-                "--format=value(textPayload)",
+                "--format=json(textPayload,timestamp,insertId)",
                 "--order=asc",
             ]
             if project:
@@ -574,12 +712,14 @@ def monitor_execution(
                     check=False,
                 )
                 if log_res.returncode == 0 and log_res.stdout:
-                    for line in log_res.stdout.splitlines():
-                        line_str = line.strip()
-                        if not line_str or line_str in seen_log_entries:
-                            continue
-                        seen_log_entries.add(line_str)
-                        print(format_monitored_line(line_str), flush=True)
+                    last_seen_timestamp = _process_log_entries(
+                        log_res.stdout,
+                        seen_log_entries=seen_log_entries,
+                        last_seen_timestamp=last_seen_timestamp,
+                        dashboard_writer=dashboard_writer,
+                        projector=projector,
+                        print_lines=True,
+                    )
             except Exception:
                 pass
 
@@ -626,13 +766,15 @@ def monitor_execution(
                         failure_msg = f"{failed} task(s) failed in Cloud Run execution"
 
                 log_filter = f'labels."run.googleapis.com/execution_name"="{execution_name}" AND (textPayload:"[STATUS:" OR textPayload:"[MILESTONE]" OR textPayload:"Score:" OR textPayload:"PASS" OR textPayload:"[ALARM]")'
+                if last_seen_timestamp:
+                    log_filter += f' AND timestamp > "{last_seen_timestamp}"'
                 log_cmd = [
                     "gcloud",
                     "logging",
                     "read",
                     log_filter,
                     "--limit=2000",
-                    "--format=value(textPayload)",
+                    "--format=json(textPayload,timestamp,insertId)",
                     "--order=asc",
                 ]
                 if project:
@@ -645,12 +787,14 @@ def monitor_execution(
                         check=False,
                     )
                     if log_res.returncode == 0 and log_res.stdout:
-                        for line in log_res.stdout.splitlines():
-                            line_str = line.strip()
-                            if not line_str or line_str in seen_log_entries:
-                                continue
-                            seen_log_entries.add(line_str)
-                            print(format_monitored_line(line_str), flush=True)
+                        last_seen_timestamp = _process_log_entries(
+                            log_res.stdout,
+                            seen_log_entries=seen_log_entries,
+                            last_seen_timestamp=last_seen_timestamp,
+                            dashboard_writer=dashboard_writer,
+                            projector=None,
+                            print_lines=True,
+                        )
                 except Exception as exc:
                     print(f"Warning: Error reading completion logs: {exc}", file=sys.stderr)
                 break
@@ -658,10 +802,22 @@ def monitor_execution(
         except Exception as exc:
             print(f"Warning: Exception in monitor_execution: {exc}", file=sys.stderr)
 
+        if dashboard_writer:
+            try:
+                dashboard_writer.write()
+            except Exception:
+                pass
+
         time.sleep(poll_interval)
 
     if not execution_succeeded and not failure_msg:
         failure_msg = "Execution did not complete successfully or condition was not met."
+
+    if dashboard_writer:
+        try:
+            dashboard_writer.write()
+        except Exception:
+            pass
 
     return MonitorResult(desc_data, execution_succeeded, failure_msg)
 
@@ -685,6 +841,14 @@ def run_preflight(
 ) -> None:
     print("[PRE-FLIGHT] Verifying cloud swarm credentials, quota tiers, repository access, and GCS bucket...", flush=True)
 
+    # Tier 3 Dedicated Model Interception
+    if model and (model.lower().strip() in TIER3_DEDICATED_MODELS or model.lower().strip().replace(".", "-").replace("-instruct", "") in TIER3_DEDICATED_MODELS):
+        raise RuntimeError(
+            f"Model '{model}' is a Tier 3 open-weights model requiring a dedicated GPU cluster endpoint.\n"
+            "Serverless Cloud Run swarms cannot dispatch directly to deploy-only models without an active dedicated endpoint.\n"
+            "Recommended Tier 1 zero-friction alternatives: gemini-4-argon, gemini-3.8-flash, deepseek-v4.1-flash."
+        )
+
     if not dry_run and runtime == "cloud-run" and not gcs_bucket:
         raise RuntimeError(
             "Cloud Run swarms require a GCS bucket to store and deliver candidate patches under the zero-push architecture.\n"
@@ -692,7 +856,7 @@ def run_preflight(
         )
 
     if not vertex_location:
-        vertex_location = "global" if model.startswith(("gemini-2.5", "gemini-3")) else region
+        vertex_location = "global" if (model and (model.startswith(("gemini-2.5", "gemini-3", "gemini-4")) or "deepseek" in model.lower())) else region
 
     # 1. Git Authentication & Repository Accessibility Check
     if not repo_url:
@@ -738,7 +902,10 @@ def run_preflight(
     except Exception as exc:
         raise RuntimeError(f"Git remote accessibility error: {exc}") from exc
 
-    # 2. Model & Quota Tier Check
+    # 2. Model & Quota Tier Check: Auto-promote Vertex for Partner models and DeepSeek
+    if (is_partner_model and is_partner_model(model)) or (model and "deepseek" in model.lower()):
+        use_vertex = True
+
     if use_vertex:
         token_cmd = subprocess.run(
             ["gcloud", "auth", "print-access-token"],
@@ -760,14 +927,43 @@ def run_preflight(
                 "GCP project ID is required for Vertex AI mode (--project or agystack-runtime.json)."
             )
 
-        if vertex_location == "global":
+        target_loc = vertex_location or "global"
+        resolved_model = model
+
+        if is_partner_model and is_partner_model(model) and "fable" not in model.lower():
+            resolved_model = PARTNER_MODEL_ALIASES.get(model.lower(), model)
+            target_loc = vertex_location if vertex_location and vertex_location != "global" else (region if region and region != "global" else "us-east5")
+            probe_url = f"https://{target_loc}-aiplatform.googleapis.com/v1/projects/{project}/locations/{target_loc}/publishers/anthropic/models/{resolved_model}:rawPredict"
+            req_data = json.dumps({
+                "anthropic_version": "vertex-2023-10-16",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }).encode("utf-8")
+        elif model and "deepseek" in model.lower():
+            target_loc = vertex_location or "global"
+            if model.startswith("publishers/"):
+                resolved_model = model.split("/")[-1]
+                probe_url = f"https://aiplatform.googleapis.com/v1/projects/{project}/locations/{target_loc}/{model}:generateContent"
+            else:
+                # Canonicalize aliases like 'deepseek', 'deepseek-flash', 'deepseek-4.1', 'deepseek-v4.1', 'deepseek-v4.1-flash'
+                resolved_model = "deepseek-v4.1-flash-maas"
+                probe_url = f"https://aiplatform.googleapis.com/v1/projects/{project}/locations/{target_loc}/publishers/deepseek-ai/models/{resolved_model}:generateContent"
+            req_data = json.dumps({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }).encode("utf-8")
+        elif target_loc == "global":
             probe_url = f"https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/google/models/{model}:generateContent"
+            req_data = json.dumps({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }).encode("utf-8")
         else:
-            probe_url = f"https://{vertex_location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{vertex_location}/publishers/google/models/{model}:generateContent"
-        req_data = json.dumps({
-            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-            "generationConfig": {"maxOutputTokens": 1},
-        }).encode("utf-8")
+            probe_url = f"https://{target_loc}-aiplatform.googleapis.com/v1/projects/{project}/locations/{target_loc}/publishers/google/models/{model}:generateContent"
+            req_data = json.dumps({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }).encode("utf-8")
 
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -781,14 +977,29 @@ def run_preflight(
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 pass
-            print(f"  [PASS] Vertex AI credentials and publisher model '{model}' verified in {vertex_location} (project: {project}).")
+            if is_partner_model and is_partner_model(model) and "fable" not in model.lower():
+                print(f"  [PASS] Vertex AI credentials and Model Garden partner model '{model}' ({resolved_model}) verified in {target_loc} (project: {project}).")
+            elif model and "deepseek" in model.lower():
+                print(f"  [PASS] Vertex AI credentials and DeepSeek MaaS model '{resolved_model}' verified in {target_loc} (project: {project}).")
+            else:
+                print(f"  [PASS] Vertex AI credentials and publisher model '{model}' verified in {target_loc} (project: {project}).")
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 403:
+            if is_partner_model and is_partner_model(model) and "fable" not in model.lower() and exc.code == 404:
                 raise RuntimeError(
-                    f"Vertex AI probe returned 403 Forbidden for project '{project}' in location '{vertex_location}'.\n"
+                    f"Vertex AI Model Garden partner model '{model}' (resolved to '{resolved_model}') not found or not enabled in location '{target_loc}' (404 Not Found).\n"
+                    f"Server Response:\n{err_body}\n"
+                    "Guidance to enable partner models in Vertex AI:\n"
+                    "1. Open Google Cloud Console -> Vertex AI -> Model Garden.\n"
+                    f"2. Search for the model ('{model}' or '{resolved_model}').\n"
+                    "3. Click 'Enable' to accept the Model Garden terms for this project.\n"
+                    f"4. Verify availability in region/location '{target_loc}'."
+                ) from exc
+            elif exc.code == 403:
+                raise RuntimeError(
+                    f"Vertex AI probe returned 403 Forbidden for project '{project}' in location '{target_loc}'.\n"
                     f"Server Response:\n{err_body}\n"
                     "Required Permissions:\n"
                     "- Ensure active principal has the 'Vertex AI User' role (roles/aiplatform.user).\n"
@@ -796,13 +1007,13 @@ def run_preflight(
                 ) from exc
             elif exc.code == 404:
                 raise RuntimeError(
-                    f"Vertex AI publisher model '{model}' not found in location '{vertex_location}' (404 Not Found).\n"
+                    f"Vertex AI publisher model '{model}' (resolved to '{resolved_model}') not found in location '{target_loc}' (404 Not Found).\n"
                     f"Server Response:\n{err_body}\n"
-                    f"Verify that model '{model}' is supported and published in location '{vertex_location}'."
+                    f"Verify that model '{model}' is supported and published in location '{target_loc}'."
                 ) from exc
             else:
                 raise RuntimeError(
-                    f"Vertex AI probe failed with HTTP {exc.code} for project '{project}' in location '{vertex_location}':\n{err_body}"
+                    f"Vertex AI probe failed with HTTP {exc.code} for project '{project}' in location '{target_loc}':\n{err_body}"
                 ) from exc
         except Exception as exc:
             if isinstance(exc, RuntimeError):
@@ -901,10 +1112,14 @@ def resolve_swarm_model(
         role_model = None
         paths_to_check = [
             agystack_models_path,
+            Path(os.path.expanduser("~/.gemini/config/plugins/agystack/agystack-models.md")),
+            Path(__file__).resolve().parents[3] / "agystack-models.md",
             Path("agystack-models.md"),
+            Path(".agents/plugins/agystack/agystack-models.md"),
+            Path(os.path.expanduser("~/.gemini/config/plugins/agystack/rules/agystack-models.md")),
+            Path(__file__).resolve().parents[3] / "rules" / "agystack-models.md",
             Path("rules/agystack-models.md"),
             Path(".agents/plugins/agystack/rules/agystack-models.md"),
-            Path(os.path.expanduser("~/.gemini/config/plugins/agystack/rules/agystack-models.md")),
         ]
         for p in paths_to_check:
             if p and p.is_file():
@@ -930,6 +1145,16 @@ def resolve_swarm_model(
         "pro": "gemini-3.1-pro",
         "flash_lite": "gemini-3.1-flash-lite",
         "flash-lite": "gemini-3.1-flash-lite",
+        "argon": "gemini-4-argon",
+        "gemini-argon": "gemini-4-argon",
+        "gemini-4": "gemini-4-argon",
+        "gemini": "gemini-3.8-flash",
+        "deepseek": "deepseek-v4.1-flash",
+        "deepseek-flash": "deepseek-v4.1-flash",
+        "deepseek-4.1": "deepseek-v4.1-flash",
+        "deepseek-v4.1": "deepseek-v4.1-flash",
+        "deepseek-4.1-flash": "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash-maas": "deepseek-v4.1-flash",
         "inherit": default_model,
         "auto": default_model,
         "inherit-parent": default_model,
@@ -943,84 +1168,41 @@ def resolve_swarm_model(
     return chosen
 
 
-def handle_mailbox_list(
-    session_id: str,
-    bucket_name: Optional[str] = None,
-    messenger: Optional[Any] = None,
-) -> List[Any]:
-    if messenger is None:
-        if not bucket_name:
-            runtime_cfg = find_runtime_config() or {}
-            bucket_name = runtime_cfg.get("gcs_bucket") or os.environ.get("GCS_BUCKET") or os.environ.get("GCS_RESULTS_BUCKET")
-        if not bucket_name:
-            print("Error: GCS bucket name must be specified via --gcs-bucket, GCS_BUCKET, or agystack-runtime.json", file=sys.stderr)
-            sys.exit(1)
-        if StorageMessenger is None:
-            print("Error: StorageMessenger is not available", file=sys.stderr)
-            sys.exit(1)
-        messenger = StorageMessenger(bucket_name=bucket_name, session_id=session_id, is_worker=False)
-
-    pending = messenger.list_pending_questions()
-    if not pending:
-        print(f"No pending questions for session '{session_id}'.")
-    else:
-        print(f"\nPending questions for session '{session_id}':")
-        print(f"{'TASK':<6} | {'SEQ':<5} | {'TIMESTAMP':<20} | {'QUESTION'}")
-        print("-" * 75)
-        for q in pending:
-            q_text = q.payload.get("question", "")
-            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(q.timestamp))
-            print(f"{q.task_index:<6} | {q.seq:<5} | {ts_str:<20} | {q_text}")
-    return pending
+try:
+    from dispatch.mailbox_controller import (
+        handle_mailbox_list,
+        handle_mailbox_reply,
+        handle_mailbox_steer,
+    )
+except ImportError:
+    try:
+        from skills.swarm.scripts.dispatch.mailbox_controller import (
+            handle_mailbox_list,
+            handle_mailbox_reply,
+            handle_mailbox_steer,
+        )
+    except ImportError:
+        _disp_dir = Path(__file__).resolve().parent / "dispatch"
+        if str(_disp_dir) not in sys.path:
+            sys.path.insert(0, str(_disp_dir))
+        from mailbox_controller import (  # type: ignore
+            handle_mailbox_list,
+            handle_mailbox_reply,
+            handle_mailbox_steer,
+        )
 
 
-def handle_mailbox_reply(
-    task_index: int,
-    seq: int,
-    text: str,
-    session_id: str,
-    bucket_name: Optional[str] = None,
-    messenger: Optional[Any] = None,
-) -> Any:
-    if messenger is None:
-        if not bucket_name:
-            runtime_cfg = find_runtime_config() or {}
-            bucket_name = runtime_cfg.get("gcs_bucket") or os.environ.get("GCS_BUCKET") or os.environ.get("GCS_RESULTS_BUCKET")
-        if not bucket_name:
-            print("Error: GCS bucket name must be specified via --gcs-bucket, GCS_BUCKET, or agystack-runtime.json", file=sys.stderr)
-            sys.exit(1)
-        if StorageMessenger is None:
-            print("Error: StorageMessenger is not available", file=sys.stderr)
-            sys.exit(1)
-        messenger = StorageMessenger(bucket_name=bucket_name, session_id=session_id, is_worker=False)
-
-    reply_env = messenger.send_reply(task_index=task_index, seq=seq, reply_text=text)
-    print(f"Reply sent to task {task_index} (seq {seq}): {text}")
-    return reply_env
-
-
-def handle_mailbox_steer(
-    task_index: int,
-    text: str,
-    session_id: str,
-    bucket_name: Optional[str] = None,
-    messenger: Optional[Any] = None,
-) -> Any:
-    if messenger is None:
-        if not bucket_name:
-            runtime_cfg = find_runtime_config() or {}
-            bucket_name = runtime_cfg.get("gcs_bucket") or os.environ.get("GCS_BUCKET") or os.environ.get("GCS_RESULTS_BUCKET")
-        if not bucket_name:
-            print("Error: GCS bucket name must be specified via --gcs-bucket, GCS_BUCKET, or agystack-runtime.json", file=sys.stderr)
-            sys.exit(1)
-        if StorageMessenger is None:
-            print("Error: StorageMessenger is not available", file=sys.stderr)
-            sys.exit(1)
-        messenger = StorageMessenger(bucket_name=bucket_name, session_id=session_id, is_worker=False)
-
-    steer_env = messenger.send_steer(task_index=task_index, instruction=text)
-    print(f"Steer instruction sent to task {task_index} (seq {steer_env.seq}): {text}")
-    return steer_env
+def failed_task_count(report_items: List[Dict[str, Any]], task_count: int) -> int:
+    reports = {}
+    invalid = 0
+    for item in report_items:
+        index = item.get("task_index")
+        if type(index) is not int or not 0 <= index < task_count or index in reports:
+            invalid += 1
+            continue
+        status = item.get("status")
+        reports[index] = status if isinstance(status, str) and status in TERMINAL_STATES else "UNKNOWN"
+    return invalid + sum(reports.get(index) != "PASS" for index in range(task_count))
 
 
 def print_candidate_patches_table(
@@ -1118,10 +1300,19 @@ def main() -> None:
     parser.add_argument("--orchestrator-timeout", type=float, default=600.0, help="Timeout in seconds for orchestrator replies (default: 600.0).")
     parser.add_argument("--set-secrets", type=str, help="Comma-separated secrets mapping for Cloud Run Job (e.g. GEMINI_API_KEY=gemini-key:latest).")
     parser.add_argument("--base-branch", type=str, default=None, help="Base branch for workers to checkout (default: remote default branch).")
+    parser.add_argument("--conversation-id", type=str, default=None, help="Coordinator conversation ID for swarm dashboard artifact.")
     parser.add_argument("--ignore-partial-failures", action="store_true", help="Allow promotion of candidate patches from partially-failed swarm executions.")
+    parser.add_argument("--list-models", action="store_true", help="List supported cloud swarm models and their Model Garden friction tiers.")
     parser.set_defaults(wait=True)
 
     subparsers = parser.add_subparsers(dest="subcommand", help="Optional subcommand")
+    steer_sub = subparsers.add_parser("steer", help="Send a steering instruction to worker(s)")
+    steer_sub.add_argument("--task", type=str, required=True, help="Task index or 'all' for broadcast")
+    steer_sub.add_argument("--instruction", "--text", dest="instruction", type=str, required=True, help="Steering instruction text")
+    steer_sub.add_argument("--session", "--session-id", dest="session", type=str, help="Session ID")
+    steer_sub.add_argument("--gcs-bucket", type=str, help="GCS bucket name")
+    steer_sub.add_argument("--task-count", "--max-tasks", dest="max_tasks", type=int, default=None, help="Total task count")
+
     mailbox_parser = subparsers.add_parser("mailbox", help="Interact with worker mailboxes")
     mailbox_subparsers = mailbox_parser.add_subparsers(dest="mailbox_action", help="Mailbox action")
 
@@ -1140,12 +1331,48 @@ def main() -> None:
 
     # mailbox steer
     steer_p = mailbox_subparsers.add_parser("steer", help="Send a steering instruction to a worker")
-    steer_p.add_argument("--task", type=int, required=True, help="Task index")
-    steer_p.add_argument("--text", type=str, required=True, help="Steering instruction text")
-    steer_p.add_argument("--session", type=str, help="Session ID")
+    steer_p.add_argument("--task", type=str, required=True, help="Task index or 'all' for broadcast")
+    steer_p.add_argument("--instruction", "--text", dest="instruction", type=str, required=True, help="Steering instruction text")
+    steer_p.add_argument("--session", "--session-id", dest="session", type=str, help="Session ID")
     steer_p.add_argument("--gcs-bucket", type=str, help="GCS bucket name")
+    steer_p.add_argument("--task-count", "--max-tasks", dest="max_tasks", type=int, default=None, help="Total task count")
 
     args = parser.parse_args()
+
+    if getattr(args, "list_models", False):
+        print("""
+Vertex AI Model Garden Tiers for Cloud Swarms:
+-----------------------------------------------------------------------------------------
+Tier 1: Native MaaS (Instant Serverless, Zero Forms)
+  - gemini-4-argon              Global Vertex AI endpoint, deep reasoning
+  - gemini-3.8-flash            Global Vertex AI endpoint, balanced speed
+  - gemini-3.1-pro              Global Vertex AI endpoint, high capability
+  - deepseek-v4.1-flash         Global Vertex AI endpoint (deepseek-ai namespace)
+
+Tier 2: Gated Partner MaaS (One-Time Console Agreement Form Required)
+  - claude-3-7-sonnet           Regional endpoint (us-east5/us-central1)
+  - claude-3-5-sonnet           Regional endpoint (us-east5/us-central1)
+  - claude-3-opus               Regional endpoint (us-east5/us-central1)
+
+Tier 3: Dedicated GPU Cluster Endpoints (Self-Hosted, Not Serverless)
+  - glm-5-3-flash               Requires dedicated 8x H100/B200 GPU cluster
+  - llama-3.3-70b               Requires dedicated multi-GPU cluster
+-----------------------------------------------------------------------------------------
+""".strip())
+        return
+
+    if args.subcommand == "steer":
+        runtime_cfg = find_runtime_config() or {}
+        session_id = args.session or os.environ.get("SWARM_SESSION_ID") or os.environ.get("SESSION_ID") or "default"
+        bkt = args.gcs_bucket or runtime_cfg.get("gcs_bucket") or os.environ.get("GCS_BUCKET") or os.environ.get("GCS_RESULTS_BUCKET")
+        handle_mailbox_steer(
+            task_index=args.task,
+            text=args.instruction,
+            session_id=session_id,
+            bucket_name=bkt,
+            max_tasks=getattr(args, "max_tasks", None),
+        )
+        return
 
     if args.subcommand == "mailbox":
         runtime_cfg = find_runtime_config() or {}
@@ -1156,12 +1383,19 @@ def main() -> None:
         elif args.mailbox_action == "reply":
             handle_mailbox_reply(task_index=args.task, seq=args.seq, text=args.text, session_id=session_id, bucket_name=bkt)
         elif args.mailbox_action == "steer":
-            handle_mailbox_steer(task_index=args.task, text=args.text, session_id=session_id, bucket_name=bkt)
+            handle_mailbox_steer(
+                task_index=args.task,
+                text=args.instruction,
+                session_id=session_id,
+                bucket_name=bkt,
+                max_tasks=getattr(args, "max_tasks", None),
+            )
         else:
             mailbox_parser.print_help()
         return
 
     runtime_cfg = find_runtime_config() or {}
+
     job_name = args.job_name or runtime_cfg.get("job_name") or "agystack-swarm-worker"
     region = args.region or runtime_cfg.get("region") or "us-central1"
     project = args.project or runtime_cfg.get("project_id")
@@ -1172,7 +1406,26 @@ def main() -> None:
         runtime_model=runtime_cfg.get("model"),
         parent_model=getattr(args, "parent_model", None),
     )
-    vertex_location = args.vertex_location or runtime_cfg.get("vertex_location") or ("global" if model.startswith(("gemini-2.5", "gemini-3")) else region)
+    explicit_vertex_loc = args.vertex_location or runtime_cfg.get("vertex_location")
+    if explicit_vertex_loc:
+        vertex_location = explicit_vertex_loc
+    elif model and (model.startswith(("gemini-2.5", "gemini-3", "gemini-4")) or "deepseek" in model.lower()):
+        vertex_location = "global"
+    else:
+        vertex_location = region
+
+    if is_partner_model and is_partner_model(model):
+        use_vertex = True
+        if not explicit_vertex_loc and vertex_location == "global":
+            vertex_location = region if region and region != "global" else "us-east5"
+    elif model and "deepseek" in model.lower():
+        use_vertex = True
+        if not explicit_vertex_loc:
+            vertex_location = "global"
+
+    gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_api_key and (project or (is_partner_model and is_partner_model(model)) or (model and "deepseek" in model.lower())):
+        use_vertex = True
     gcs_bucket = args.gcs_bucket if args.gcs_bucket is not None else runtime_cfg.get("gcs_bucket", "")
 
     if args.harvest_session:
@@ -1196,7 +1449,15 @@ def main() -> None:
             print(f"Error: Failed to harvest GCS results for session {session_id}: {exc}", file=sys.stderr)
             sys.exit(1)
 
-        print_candidate_patches_table(harvested_patches, baseline_score=args.baseline_score)
+        failed_count = failed_task_count(harvested_patches, args.tasks) if args.tasks and args.tasks > 0 else 1
+        print_candidate_patches_table(
+            harvested_patches, baseline_score=args.baseline_score, failed_count=failed_count,
+            allow_partial=args.ignore_partial_failures,
+        )
+        if not args.tasks:
+            print("Complete task coverage is unknown. Supply --tasks to verify the expected count.")
+        if failed_count:
+            sys.exit(1)
         return
 
     if args.wait_execution:
@@ -1215,12 +1476,25 @@ def main() -> None:
 
         bkt = gcs_bucket or os.environ.get("GCS_BUCKET") or os.environ.get("GCS_RESULTS_BUCKET")
         task_count = args.tasks or 1
+        dashboard_writer = SwarmDashboardWriter(
+            session_id=session_id,
+            conversation_id=args.conversation_id or os.environ.get("CONVERSATION_ID"),
+            task_count=task_count,
+            project=project,
+            region=region,
+            execution_name=execution_name,
+            gcs_bucket=bkt,
+            model=model,
+        )
+        dashboard_writer.write()
         print(f"Attaching to Cloud Run execution '{execution_name}' in region '{region}'...")
         desc_data, exec_succeeded, failure_msg = wait_for_execution(
             execution_name=execution_name,
             project=project,
             region=region,
             task_count=task_count,
+            session_id=session_id,
+            dashboard_writer=dashboard_writer,
         )
         if not exec_succeeded:
             print(f"Error: Cloud Run execution '{execution_name}' failed: {failure_msg}", file=sys.stderr)
@@ -1243,8 +1517,13 @@ def main() -> None:
             except Exception as exc:
                 print(f"Warning: Failed to harvest GCS results: {exc}", file=sys.stderr)
 
+        expected_count = args.tasks
+        if isinstance(desc_data, dict):
+            expected_count = desc_data.get("spec", {}).get("taskCount", desc_data.get("taskCount", expected_count))
+        failed_cnt = failed_task_count(harvested_patches, expected_count) if type(expected_count) is int and expected_count > 0 else 1
+        if not exec_succeeded:
+            failed_cnt = max(1, failed_cnt)
         if harvested_patches:
-            failed_cnt = 0 if exec_succeeded else 1
             print_candidate_patches_table(
                 harvested_patches,
                 baseline_score=args.baseline_score,
@@ -1253,9 +1532,35 @@ def main() -> None:
                 allow_partial=getattr(args, "ignore_partial_failures", False),
             )
 
-        if not exec_succeeded:
+        if not exec_succeeded or failed_cnt:
+            print("Execution lacks complete passing task status coverage.", file=sys.stderr)
             sys.exit(1)
         return
+
+    tasks_list: List[Any] = []
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    if args.seed_lottery:
+        from manifest_generator import generate_seed_lottery
+        tasks_list = generate_seed_lottery(seeds_count=args.seed_lottery)
+    elif args.manifest:
+        try:
+            tasks_list = load_manifest(args.manifest)
+        except Exception as exc:
+            print(f"Error: Failed to load manifest: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        resolve_execution_limits()
+        for task in tasks_list:
+            if isinstance(task, dict):
+                resolve_execution_limits(task.get("execution_limits", {}), environ={})
+    except ValueError as exc:
+        parser.error(str(exc))
+    task_count = args.tasks or (len(tasks_list) if tasks_list else 1)
+    if tasks_list and task_count != len(tasks_list):
+        parser.error("--tasks must match the manifest task count")
+    manifest_serialized = json.dumps(tasks_list) if tasks_list else ""
 
     repo_url = args.repo or get_git_remote_url()
     gh_token = get_gh_token()
@@ -1329,28 +1634,14 @@ def main() -> None:
         sys.exit(1)
 
     if not gh_token and "GH_TOKEN" not in active_secret_keys and "gh_token" not in active_secret_keys:
-        print("Error: GH_TOKEN could not be resolved from environment or `gh auth token`", file=sys.stderr)
-        sys.exit(1)
+        if not args.dry_run:
+            print("Error: GH_TOKEN could not be resolved from environment or `gh auth token`", file=sys.stderr)
+            sys.exit(1)
+        gh_token = "DRY_RUN_GH_TOKEN"
 
     if not use_vertex and not gemini_api_key and not args.dry_run and "GEMINI_API_KEY" not in active_secret_keys and "gemini_api_key" not in active_secret_keys:
         print("Error: GEMINI_API_KEY environment variable is required when not in Vertex AI mode.", file=sys.stderr)
         sys.exit(1)
-
-    tasks_list: List[Any] = []
-    sys.path.insert(0, str(Path(__file__).parent))
-
-    if args.seed_lottery:
-        from manifest_generator import generate_seed_lottery
-        tasks_list = generate_seed_lottery(seeds_count=args.seed_lottery)
-    elif args.manifest:
-        try:
-            tasks_list = load_manifest(args.manifest)
-        except Exception as exc:
-            print(f"Error: Failed to load manifest: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-    task_count = args.tasks or (len(tasks_list) if tasks_list else 1)
-    manifest_serialized = json.dumps(tasks_list) if tasks_list else ""
 
     env_vars = {
         "REPO_URL": repo_url,
@@ -1373,6 +1664,9 @@ def main() -> None:
     session_id = args.session_id or f"swarm-{int(time.time())}"
     env_vars["SWARM_SESSION_ID"] = session_id
     env_vars["SESSION_ID"] = session_id
+    for name, env_key in LIMIT_ENV.items():
+        if env_key in os.environ:
+            env_vars[env_key] = os.environ[env_key]
     if args.orchestrator_timeout:
         env_vars["ORCHESTRATOR_TIMEOUT"] = str(args.orchestrator_timeout)
     if args.base_branch:
@@ -1405,7 +1699,10 @@ def main() -> None:
         env_vars["TASK_MANIFEST"] = manifest_serialized
 
     if model:
-        env_vars["MODEL_OVERRIDE"] = model
+        if model.lower().strip() in DEEPSEEK_CANONICAL_ALIASES:
+            env_vars["MODEL_OVERRIDE"] = "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas"
+        else:
+            env_vars["MODEL_OVERRIDE"] = model
 
     dispatch_cmd = build_gcloud_command(
         job_name=job_name,
@@ -1470,6 +1767,32 @@ def main() -> None:
             print(f"Error updating job secrets: {exc.stderr.strip()}", file=sys.stderr)
             sys.exit(exc.returncode)
 
+    projector = ShadowTranscriptProjector(session_id=session_id, task_count=task_count)
+    dashboard_writer = SwarmDashboardWriter(
+        session_id=session_id,
+        conversation_id=getattr(args, "conversation_id", None) or os.environ.get("CONVERSATION_ID"),
+        task_count=task_count,
+        project=project,
+        region=region,
+        execution_name=None,
+        gcs_bucket=gcs_bucket,
+        model=model,
+        tasks_list=tasks_list,
+    )
+    dashboard_writer.write()
+
+    for t_idx in range(task_count):
+        brief_text = ""
+        if tasks_list and t_idx < len(tasks_list):
+            item = tasks_list[t_idx]
+            if isinstance(item, dict):
+                brief_text = item.get("brief") or item.get("task_brief") or item.get("command") or ""
+            elif isinstance(item, str):
+                brief_text = item
+        projector.init_task(t_idx, task_brief=brief_text)
+        task_conv_url = format_conversation_url(session_id, t_idx)
+        print(f"[Cloud Swarm] Task {t_idx} shadow session: {task_conv_url}", flush=True)
+
     print(f"Launching Cloud Run Job '{job_name}' with {task_count} tasks (parallelism: {parallelism})...")
     try:
         proc = subprocess.run(
@@ -1492,6 +1815,10 @@ def main() -> None:
             if m:
                 execution_name = m.group(1)
 
+        if execution_name:
+            dashboard_writer.set_execution_name(execution_name)
+            dashboard_writer.write()
+
         if not args.wait:
             if execution_name:
                 print(f"Execution: {execution_name}")
@@ -1511,6 +1838,9 @@ def main() -> None:
                 project=project,
                 region=region,
                 task_count=task_count,
+                projector=projector,
+                session_id=session_id,
+                dashboard_writer=dashboard_writer,
             )
             if not exec_succeeded:
                 print(f"Error: Cloud Run execution '{execution_name}' failed: {exec_failure_msg}", file=sys.stderr)
@@ -1552,6 +1882,7 @@ def main() -> None:
                     time.sleep(5)
                 except Exception as exc:
                     print(f"Warning: Failed to fetch container logs: {exc}", file=sys.stderr)
+
 
         harvest_target = args.harvest_gcs or (gcs_prefix if gcs_bucket else None)
         harvested_patches = []
@@ -1610,7 +1941,7 @@ def main() -> None:
             print(f"Total: {len(report_items)} | PASS: {pass_count} | ISSUES: {issues_count} | BLOCKED: {blocked_count}")
             print("=" * 80)
 
-        failed_tasks_count = issues_count + blocked_count
+        failed_tasks_count = failed_task_count(report_items, task_count)
         if not exec_succeeded and failed_tasks_count == 0:
             failed_tasks_count = 1
 
@@ -1628,7 +1959,9 @@ def main() -> None:
         else:
             print(f"\n[STATUS: EXECUTION_SUCCESS] (All {len(report_items) or task_count} tasks succeeded)")
 
-        if not exec_succeeded:
+        cleanup_session(session_id=session_id, bucket_name=gcs_bucket)
+
+        if not exec_succeeded or failed_tasks_count > 0:
             sys.exit(1)
 
     except subprocess.CalledProcessError as exc:

@@ -34,25 +34,41 @@ this repository is **agystack**, the agentic engineering framework for Google An
 
 ### prerequisites
 
-- `bun` (v1.0+) is mandatory for PR babysitting (`watch-pr`) and multi-agent orchestration (`orch`). Node.js is not supported.
+- `bun` (v1.0+) is used for PR babysitting (`watch-pr`). Orchestration is native agentic markdown via Brain Artifacts. Node.js is not supported.
 - `gh` (GitHub CLI) is required for PR automation and preflight checks.
 - `gt` (Graphite CLI) is recommended for stacked PRs.
 
-Install agystack globally (for all workspaces) or locally in your project:
+### installation methods
 
-Option A: Global install (recommended)
+#### Option 1: Antigravity Marketplace (Recommended)
+
+From the Antigravity CLI:
+```bash
+agy plugin install agystack
+```
+
+Or inside the Antigravity App:
+1. Open the left sidebar and select **Customizations**.
+2. Switch to the **Marketplace** tab.
+3. Search for `agystack` and click **Install**.
+
+#### Option 2: Ask the agent
+
+In any conversation turn, prompt:
+```text
+install this antigravity plugin for me: https://github.com/jtaroreh/agystack
+```
+
+#### Option 3: Manual Git Clone
+
+Global install (all workspaces):
 ```bash
 git clone https://github.com/jtaroreh/agystack.git ~/.gemini/config/plugins/agystack
 ```
 
-Option B: Workspace-local install
+Workspace-local install:
 ```bash
 git clone https://github.com/jtaroreh/agystack.git .agents/plugins/agystack
-```
-
-**or honestly. you can probably just tell your chat**
-```text
-install this antigravity plugin for me: https://github.com/jtaroreh/agystack
 ```
 
 Native Antigravity tools (`invoke_subagent`, `run_command`, `manage_task`, `schedule`, `ask_question`, and visual Artifacts) are documented in [`skills/poteto-mode/references/antigravity-tools.md`](./skills/poteto-mode/references/antigravity-tools.md).
@@ -143,6 +159,25 @@ workers run in isolated containers, never push to git directly, and upload `patc
 
 set it up with [`/setup-agystack`](./skills/setup-agystack/SKILL.md) with your Google Cloud auth and run [`/swarm`](./skills/swarm/SKILL.md) to dispatch.
 
+### summoning cloud agents (Gemini & DeepSeek)
+
+Cloud swarms run on Google Cloud Run with zero-friction serverless models:
+
+```bash
+# list supported cloud models and tiers
+python3 skills/swarm/scripts/cloud_dispatch.py --list-models
+
+# fan out 5 Gemini Argon agents
+python3 skills/swarm/scripts/cloud_dispatch.py --tasks 5 --model gemini-4-argon
+
+# fan out 5 DeepSeek Flash 4.1 agents
+python3 skills/swarm/scripts/cloud_dispatch.py --tasks 5 --model deepseek-v4.1-flash
+```
+
+Or trigger `/swarm` right in chat:
+- `/swarm 5 workers using Gemini Argon to test src/`
+- `/swarm 5 workers using DeepSeek Flash to explore hypotheses`
+
 ## skills
 
 [`/poteto-mode`](./skills/poteto-mode/SKILL.md) runs most of these for you when a step needs them (`how`, `why`, `architect`, `arena`, `swarm`, `interrogate`, `unslop`, `no-comments`, `technical-writing`, `tdd`, and the principles). the table below is for when you want one directly:
@@ -188,6 +223,7 @@ set it up with [`/setup-agystack`](./skills/setup-agystack/SKILL.md) with your G
 | [`/unslop`](./skills/unslop/SKILL.md) | you're cleaning up writing. removes AI tells. |
 | [`/bro`](./skills/bro/SKILL.md) | you want the last message restated in plain human language, no jargon. |
 | [`/technical-writing`](./skills/technical-writing/SKILL.md) | layered doc standard (Diátaxis + Google developer style + STE + Global English) for docs, RFCs, readmes, PR descriptions, commit messages. |
+| [`/statechart`](./skills/statechart/SKILL.md) | you want to model system states, transitions, invariants, and failure modes as native Mermaid diagrams. |
 
 </details>
 
@@ -276,6 +312,7 @@ twenty-three short skills, one principle each. `poteto-mode` indexes them inline
 | [fix-root-causes](./skills/principle-fix-root-causes/SKILL.md) | verification | Trace each symptom to its root cause and fix it there; reproduce first, ask why until you reach it, resist nil-check guards that silence crashes. |
 | [sequence-verifiable-units](./skills/principle-sequence-verifiable-units/SKILL.md) | verification | Apply to multi-step work (sweeps, migrations, runs of similar edits) and to how you stack commits and PRs. Break work into small units that each end in a verifiable state, check each before the next, and order delivery so the sequence proves itself to a reviewer. |
 | [test-behavior-not-implementation](./skills/principle-test-behavior-not-implementation/SKILL.md) | verification | Test what the system does from the outside, not how it is structured internally. |
+| [explain-the-number](./skills/principle-explain-the-number/SKILL.md) | verification | When reporting performance numbers or claiming speedups, name the bottleneck and physical cause rather than guessing from code. |
 | [guard-the-context-window](./skills/principle-guard-the-context-window/SKILL.md) | delegation | Route bulk to subagents; keep summaries in the main thread, not raw payloads. |
 | [never-block-on-the-human](./skills/principle-never-block-on-the-human/SKILL.md) | delegation | Proceed, present the result, let the human course-correct after the fact; reserve confirmation for irreversible actions. |
 | [encode-lessons-in-structure](./skills/principle-encode-lessons-in-structure/SKILL.md) | meta | Encode the rule as a lint, metadata flag, runtime check, or script instead of more text. |

@@ -10,13 +10,34 @@ In this page you install the plugin, pick which models agystack uses, and run yo
 
 ## Install the plugin
 
-Install agystack globally or for a specific workspace:
+You can install agystack from the official Antigravity Marketplace or directly via git:
+
+### Option 1: Antigravity Marketplace (Recommended)
+
+From the Antigravity CLI:
+```bash
+agy plugin install agystack
+```
+
+Or via the Antigravity App UI:
+1. Open the left sidebar and select **Customizations**.
+2. Switch to the **Marketplace** tab.
+3. Search for `agystack` and click **Install**.
+
+### Option 2: Ask the agent
+
+In your agent chat session:
+```text
+install this antigravity plugin for me: https://github.com/jtaroreh/agystack
+```
+
+### Option 3: Direct git clone
 
 ```bash
-# Option A: Global installation (recommended - applies across all projects)
+# Global installation (recommended - applies across all projects)
 git clone https://github.com/jtaroreh/agystack ~/.gemini/config/plugins/agystack
 
-# Option B: Workspace-only installation (applies to current project)
+# Workspace-only installation (applies to current project)
 git clone https://github.com/jtaroreh/agystack .agents/plugins/agystack
 ```
 Restart Antigravity or start a new chat so it discovers the plugin.
@@ -29,7 +50,7 @@ Run:
 /setup-agystack
 ```
 
-[`/setup-agystack`](../../skills/setup-agystack/SKILL.md) detects the models you have access to, shows you each role (code delegates, judgment, the review panels), and asks what you want. Answer the questions. It writes `~/.gemini/config/plugins/agystack/rules/agystack-models.md`, a small rule every agystack skill reads.
+[`/setup-agystack`](../../skills/setup-agystack/SKILL.md) detects the models you have access to, shows you each role (code delegates, judgment, the review panels), and asks what you want. Answer the questions. It writes `~/.gemini/config/plugins/agystack/agystack-models.md`, a configuration file every agystack skill reads.
 
 You only override what you care about. A role with no line in the rule keeps the skill's default. To restore a default later, delete that role's line, or just run `/setup-agystack` again.
 

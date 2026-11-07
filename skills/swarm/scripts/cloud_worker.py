@@ -8,11 +8,8 @@ delivers candidate patches via GCS under zero-push architecture,
 and outputs a structured report.
 """
 
-from dataclasses import dataclass, field
-import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -36,7 +33,7 @@ Guidelines:
 1. Implement the requested task directly and surgically in the workspace.
 2. Maintain high engineering rigor: run test suites and verification commands before completing.
 3. Keep diffs minimal and clean. Avoid narrating comments or speculative code.
-4. Conclude with a clear summary and status ([STATUS: PASS] or [STATUS: ISSUES]).
+4. End your final response with exactly one standalone unquoted status line outside code fences, [STATUS: PASS], [STATUS: ISSUES], or [STATUS: BLOCKED].
 """
 
 
@@ -47,277 +44,238 @@ def emit_milestone(task_index: int, phase: str, detail: str = "") -> None:
     print(msg, flush=True)
 
 
-@dataclass
-class ToolInvocationRecord:
-    tool_name: str
-    args_hash: str
-    output_hash: str = ""
-    timestamp: float = field(default_factory=time.time)
-    duration_s: float = 0.0
-    success: bool = True
-    args_summary: str = ""
+def emit_telemetry(
+    task_index: int,
+    event_type: str,
+    data: Optional[Dict[str, Any]] = None,
+    timestamp: Optional[float] = None,
+    stream: Optional[Any] = None,
+) -> None:
+    ts = timestamp if timestamp is not None else time.time()
+    payload = {
+        "timestamp": ts,
+        "event": event_type,
+        "task_index": task_index,
+    }
+    if data:
+        payload.update(data)
+    line = f"[TELEMETRY] [TASK {task_index}] {json.dumps(payload, default=str)}"
+    target = stream if stream is not None else sys.stderr
+    try:
+        print(line, file=target, flush=True)
+    except Exception:
+        pass
 
-    @classmethod
-    def create(cls, tool_name: str, args: Any = None) -> "ToolInvocationRecord":
-        args = args if args is not None else {}
+
+def emit_thought(
+    task_index_or_thought: Any,
+    thought: Optional[str] = None,
+    timestamp: Optional[float] = None,
+    stream: Optional[Any] = None,
+) -> None:
+    if thought is None and isinstance(task_index_or_thought, str):
+        task_idx = 0
+        th = task_index_or_thought
+    elif isinstance(task_index_or_thought, int):
+        task_idx = task_index_or_thought
+        th = thought or ""
+    else:
+        task_idx = 0
+        th = str(task_index_or_thought)
+    emit_telemetry(
+        task_idx,
+        "thought",
+        {"thought": th},
+        timestamp=timestamp,
+        stream=stream,
+    )
+
+
+def emit_tool_invocation(
+    task_index: int,
+    tool_name: str,
+    args: Any = None,
+    call_id: Optional[str] = None,
+    timestamp: Optional[float] = None,
+    stream: Optional[Any] = None,
+) -> None:
+    tool_args = args if isinstance(args, dict) else ({"args": str(args)} if args is not None else {})
+    emit_telemetry(
+        task_index,
+        "tool_call",
+        {
+            "tool_name": tool_name,
+            "args": tool_args,
+            "call_id": call_id or "",
+        },
+        timestamp=timestamp,
+        stream=stream,
+    )
+
+
+def emit_tool_result(
+    task_index: int,
+    tool_name: str,
+    output: Any = "",
+    success: bool = True,
+    call_id: Optional[str] = None,
+    duration_s: float = 0.0,
+    timestamp: Optional[float] = None,
+    stream: Optional[Any] = None,
+) -> None:
+    emit_telemetry(
+        task_index,
+        "tool_result",
+        {
+            "tool_name": tool_name,
+            "output": output,
+            "success": success,
+            "call_id": call_id or "",
+            "duration_s": duration_s,
+        },
+        timestamp=timestamp,
+        stream=stream,
+    )
+
+
+def emit_user_input(
+    task_index: int,
+    content: str,
+    timestamp: Optional[float] = None,
+    stream: Optional[Any] = None,
+) -> None:
+    emit_telemetry(
+        task_index,
+        "user_input",
+        {"content": content},
+        timestamp=timestamp,
+        stream=stream,
+    )
+
+
+def emit_agent_response(
+    task_index: int,
+    content: str,
+    timestamp: Optional[float] = None,
+    stream: Optional[Any] = None,
+) -> None:
+    emit_telemetry(
+        task_index,
+        "agent_response",
+        {"content": content},
+        timestamp=timestamp,
+        stream=stream,
+    )
+
+
+try:
+    from worker.execution import CREDENTIAL_PATTERNS as CREDENTIAL_PATTERNS, scrub_credentials
+except ImportError:
+    from skills.swarm.scripts.worker.execution import CREDENTIAL_PATTERNS as CREDENTIAL_PATTERNS, scrub_credentials
+
+
+class TokenShield:
+    def __init__(
+        self,
+        task_index: int = 0,
+        target_stream: Optional[Any] = None,
+        telemetry_stream: Optional[Any] = None,
+    ):
+        self.task_index = task_index
+        self.target_stream = target_stream
+        self.telemetry_stream = telemetry_stream or sys.stderr
+        self.captured_thoughts: List[str] = []
+        self._orig_stdout: Optional[Any] = None
+        self._buffer = ""
+
+    def __enter__(self) -> "TokenShield":
+        self._orig_stdout = sys.stdout
+        self.target_stream = self.target_stream or self._orig_stdout
+        sys.stdout = self
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         try:
-            canonical = json.dumps(args, sort_keys=True, default=str)
-        except Exception:
-            canonical = str(args)
-        args_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
-        if isinstance(args, dict):
-            args_summary = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            if self._buffer.strip():
+                self._handle_non_milestone(self._buffer)
+                self._buffer = ""
+        finally:
+            if self._orig_stdout is not None:
+                sys.stdout = self._orig_stdout
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._process_line(line)
+        return len(s)
+
+    def _process_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        if stripped.startswith("[MILESTONE]"):
+            out = self.target_stream or self._orig_stdout or sys.__stdout__
+            out.write(line + "\n")
+            if hasattr(out, "flush"):
+                out.flush()
         else:
-            args_summary = str(args)
-        return cls(
-            tool_name=tool_name,
-            args_hash=args_hash,
-            output_hash="",
-            timestamp=time.time(),
-            duration_s=0.0,
-            success=True,
-            args_summary=args_summary,
-        )
+            self._handle_non_milestone(stripped)
 
+    def _handle_non_milestone(self, text: str) -> None:
+        scrubbed = scrub_credentials(text)
+        self.captured_thoughts.append(scrubbed)
+        emit_thought(self.task_index, scrubbed, stream=self.telemetry_stream)
 
-class StagnancyTracker:
-    def __init__(self, window_size: int = 10):
-        self.window_size = window_size
-        self.window: List[ToolInvocationRecord] = []
-        self._last_key: Optional[Tuple[str, str]] = None
-        self._consecutive_count: int = 0
+    def flush(self) -> None:
+        out = self.target_stream or self._orig_stdout or sys.__stdout__
+        if hasattr(out, "flush"):
+            out.flush()
 
-    def record_start(self, record: Any) -> Tuple[bool, int, str]:
-        try:
-            if not isinstance(record, ToolInvocationRecord):
-                return False, 1, ""
+    def emit_milestone(self, phase: str, detail: str = "") -> None:
+        emit_milestone(self.task_index, phase, detail)
 
-            key = (record.tool_name, record.args_hash)
-            if self._last_key == key:
-                self._consecutive_count += 1
-            else:
-                self._last_key = key
-                self._consecutive_count = 1
+    def emit_thought(self, thought: str) -> None:
+        scrubbed = scrub_credentials(thought)
+        self.captured_thoughts.append(scrubbed)
+        emit_thought(self.task_index, scrubbed, stream=self.telemetry_stream)
 
-            self.window.append(record)
-            if len(self.window) > self.window_size:
-                self.window.pop(0)
-
-            is_stagnant = self._consecutive_count >= 3
-            warning = ""
-            if is_stagnant:
-                warning = (
-                    f"Warning: Tool '{record.tool_name}' has been executed {self._consecutive_count} "
-                    f"consecutive times with identical arguments. You may be stuck in a loop; "
-                    f"consider trying an alternative tool or different parameters."
-                )
-            return is_stagnant, self._consecutive_count, warning
-        except Exception:
-            return False, 1, ""
-
-    def record_result(
+    def emit_tool_invocation(
         self,
         tool_name: str,
-        args_hash: str,
-        output: Any,
-        success: bool,
-        duration_s: float,
+        args: Any = None,
+        call_id: Optional[str] = None,
     ) -> None:
-        try:
-            out_str = output if isinstance(output, str) else str(output)
-            out_hash = hashlib.sha256(out_str.encode("utf-8")).hexdigest()[:12]
-            for rec in reversed(self.window):
-                if rec.tool_name == tool_name and rec.args_hash == args_hash:
-                    rec.output_hash = out_hash
-                    rec.success = success
-                    rec.duration_s = duration_s
-                    break
-        except Exception:
-            pass
+        emit_tool_invocation(self.task_index, tool_name, args, call_id=call_id, stream=self.telemetry_stream)
+
+    def emit_tool_result(
+        self,
+        tool_name: str,
+        output: Any = "",
+        success: bool = True,
+        call_id: Optional[str] = None,
+        duration_s: float = 0.0,
+    ) -> None:
+        emit_tool_result(self.task_index, tool_name, output, success=success, call_id=call_id, duration_s=duration_s, stream=self.telemetry_stream)
 
 
-def create_agent_hooks(
-    messenger: Optional[Any],
-    task_index: int,
-    tracker: StagnancyTracker,
-    hooks_module: Optional[Any] = None,
-    types_module: Optional[Any] = None,
-) -> List[Any]:
-    h = hooks_module
-    t = types_module
-    if h is None or t is None:
-        try:
-            from google.antigravity.hooks import hooks as mod_hooks
-            from google.antigravity import types as mod_types
 
-            h = h or mod_hooks
-            t = t or mod_types
-        except (ImportError, AttributeError):
-            pass
-
-    if h is None or t is None:
-        return []
-
-    in_flight: List[Dict[str, Any]] = []
-
-    @h.pre_tool_call_decide
-    async def pre_tool_call_decide(tool_call: Any) -> Any:
-        steer_context = None
-        if messenger and hasattr(messenger, "check_steer_instructions"):
-            try:
-                steer_envelopes = messenger.check_steer_instructions() or []
-            except Exception:
-                steer_envelopes = []
-            for item in steer_envelopes:
-                instruction = ""
-                if isinstance(item, str):
-                    instruction = item
-                elif isinstance(item, dict):
-                    instruction = item.get("instruction") or item.get("text") or ""
-                elif hasattr(item, "payload") and isinstance(item.payload, dict):
-                    instruction = item.payload.get("instruction") or item.payload.get("text") or ""
-                elif hasattr(item, "instruction"):
-                    instruction = getattr(item, "instruction", "")
-
-                if not instruction:
-                    continue
-
-                trimmed = instruction.strip()
-                if trimmed.startswith("ABORT") or trimmed.startswith("CANCEL"):
-                    emit_milestone(task_index, "ABORT_REQUESTED", instruction)
-                    try:
-                        return t.HookResult(
-                            allow=False,
-                            error_message=f"Execution aborted by orchestrator: {instruction}",
-                        )
-                    except TypeError:
-                        return t.HookResult(allow=False)
-                else:
-                    emit_milestone(task_index, "STEER_APPLIED", instruction)
-                    steer_context = instruction
-
-        tool_name = getattr(tool_call, "name", "tool")
-        tool_args = getattr(tool_call, "args", {})
-        record = ToolInvocationRecord.create(tool_name, tool_args)
-        is_stagnant, count, warning = tracker.record_start(record)
-        in_flight.append({
-            "tool_name": tool_name,
-            "args_hash": record.args_hash,
-            "t0": time.time(),
-            "id": id(tool_call),
-        })
-
-        emit_milestone(task_index, "TOOL_START", f"{tool_name}: {record.args_summary[:60]}")
-
-        if is_stagnant:
-            emit_milestone(task_index, "POTENTIAL_LOOP", f"{tool_name} (repeated {count}x)")
-            print(
-                f"[ALARM] [TASK {task_index}] [POTENTIAL_LOOP] Tool '{tool_name}' repeated {count} times with identical inputs.",
-                flush=True,
-            )
-            try:
-                return t.HookResult(allow=True, custom_context=warning)
-            except TypeError:
-                return t.HookResult(allow=True)
-
-        if steer_context:
-            try:
-                return t.HookResult(allow=True, custom_context=steer_context)
-            except TypeError:
-                return t.HookResult(allow=True)
-
-        return t.HookResult(allow=True)
-
-    @h.post_tool_call
-    async def post_tool_call(data: Any) -> None:
-        matched = None
-        call_obj = getattr(data, "call", None)
-        data_id = getattr(data, "id", None) or (getattr(call_obj, "id", None) if call_obj else None)
-        data_name = getattr(data, "name", getattr(data, "tool_name", None))
-        if data_name is None and call_obj is not None:
-            data_name = getattr(call_obj, "name", getattr(call_obj, "tool_name", None))
-
-        match_idx = -1
-        for idx, entry in enumerate(in_flight):
-            if data_id is not None and entry.get("id") == data_id:
-                match_idx = idx
-                break
-            if entry.get("id") == id(data) or (call_obj is not None and entry.get("id") == id(call_obj)):
-                match_idx = idx
-                break
-            if data_name and entry.get("tool_name") == data_name:
-                match_idx = idx
-                break
-
-        if match_idx != -1:
-            matched = in_flight.pop(match_idx)
-        elif in_flight:
-            matched = in_flight.pop(0)
-
-        if matched:
-            tool_name = matched["tool_name"]
-            args_hash = matched["args_hash"]
-            t0 = matched.get("t0")
-            duration_s = max(0.0, time.time() - t0) if t0 is not None else 0.0
-        else:
-            tool_name = getattr(data, "name", getattr(data, "tool_name", "tool"))
-            args_hash = ""
-            duration_s = 0.0
-
-        output = getattr(data, "output", getattr(data, "result", data))
-        error = getattr(data, "error", None)
-        success = (error is None) and not isinstance(data, Exception)
-
-        tracker.record_result(tool_name, args_hash, output, success, duration_s)
-        emit_milestone(task_index, "TOOL_END", f"{tool_name} in {duration_s:.1f}s")
-
-    hooks_to_register = [pre_tool_call_decide, post_tool_call]
-    if hasattr(h, "on_tool_error"):
-        @h.on_tool_error
-        async def on_tool_error(error: Any) -> Any:
-            if in_flight:
-                matched = in_flight.pop(0)
-                t0 = matched.get("t0")
-                duration_s = max(0.0, time.time() - t0) if t0 is not None else 0.0
-                tracker.record_result(
-                    matched["tool_name"],
-                    matched["args_hash"],
-                    str(error),
-                    False,
-                    duration_s,
-                )
-                emit_milestone(task_index, "TOOL_ERROR", f"{matched['tool_name']}: {str(error)[:60]}")
-            else:
-                emit_milestone(task_index, "TOOL_ERROR", str(error)[:80])
-            return None
-        hooks_to_register.append(on_tool_error)
-
-    return hooks_to_register
-
-
-def create_ask_orchestrator_tool(
-    messenger: Any,
-    task_index: int,
-    timeout_seconds: float = 600.0,
-):
-    async def ask_orchestrator(question: str, context: str = "") -> str:
-        emit_milestone(task_index, "WAITING_FOR_ORCHESTRATOR", question[:80])
-        envelope = messenger.send_question(question=question, context=context)
-        reply = messenger.wait_for_reply(seq=envelope.seq, timeout_seconds=timeout_seconds)
-        if reply is None:
-            emit_milestone(
-                task_index,
-                "ORCHESTRATOR_TIMEOUT",
-                f"Seq {envelope.seq} timed out. Proceeding autonomously.",
-            )
-            return (
-                "Orchestrator did not respond within timeout. "
-                "Use your best autonomous judgment and document your assumptions."
-            )
-        emit_milestone(task_index, "ORCHESTRATOR_REPLY_RECEIVED", f"Seq {envelope.seq}")
-        return reply
-
-    return ask_orchestrator
+try:
+    from worker.agent_hooks import (
+        StagnancyTracker as StagnancyTracker,
+        ToolInvocationRecord as ToolInvocationRecord,
+        create_agent_hooks as create_agent_hooks,
+        create_ask_orchestrator_tool as create_ask_orchestrator_tool,
+    )
+except ImportError:
+    from skills.swarm.scripts.worker.agent_hooks import (
+        StagnancyTracker as StagnancyTracker,
+        ToolInvocationRecord as ToolInvocationRecord,
+        create_agent_hooks as create_agent_hooks,
+        create_ask_orchestrator_tool as create_ask_orchestrator_tool,
+    )
 
 
 def get_env_var(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -732,21 +690,47 @@ def parse_porcelain_status(stdout: str) -> List[str]:
     return modified_files
 
 
-def evaluate_agent_status(agent_text: str) -> Tuple[str, str]:
-    match = re.search(r"\[STATUS:\s*(PASS|ISSUES|BLOCKED|DEV_IMPROVED)\s*\]", agent_text, re.IGNORECASE)
-    if match:
-        st = match.group(1).upper()
-        if st == "DEV_IMPROVED":
-            return "PASS", agent_text
-        return st, agent_text
-    return "ISSUES", agent_text
+try:
+    from worker.execution import ExecutionLimits, evaluate_agent_status, limits_for_task, run_bounded_shell, write_diagnostic
+except ImportError:
+    from skills.swarm.scripts.worker.execution import ExecutionLimits, evaluate_agent_status, limits_for_task, run_bounded_shell, write_diagnostic
 
 
+try:
+    from worker.partner_engine import (
+        PARTNER_MODEL_ALIASES as PARTNER_MODEL_ALIASES,
+        PARTNER_MODELS as PARTNER_MODELS,
+        WORKSPACE_TOOLS as WORKSPACE_TOOLS,
+        execute_claude_model_agent as execute_claude_model_agent,
+        execute_deepseek_model_agent as execute_deepseek_model_agent,
+        execute_fable_model_agent as execute_fable_model_agent,
+        execute_partner_model_agent as execute_partner_model_agent,
+        execute_workspace_tool as execute_workspace_tool,
+        is_deepseek_model as is_deepseek_model,
+        is_fable_model as is_fable_model,
+        is_partner_model as is_partner_model,
+        measure_partner_client_startup as measure_partner_client_startup,
+    )
+except ImportError:
+    from skills.swarm.scripts.worker.partner_engine import (
+        PARTNER_MODEL_ALIASES as PARTNER_MODEL_ALIASES,
+        PARTNER_MODELS as PARTNER_MODELS,
+        WORKSPACE_TOOLS as WORKSPACE_TOOLS,
+        execute_claude_model_agent as execute_claude_model_agent,
+        execute_deepseek_model_agent as execute_deepseek_model_agent,
+        execute_fable_model_agent as execute_fable_model_agent,
+        execute_partner_model_agent as execute_partner_model_agent,
+        execute_workspace_tool as execute_workspace_tool,
+        is_deepseek_model as is_deepseek_model,
+        is_fable_model as is_fable_model,
+        is_partner_model as is_partner_model,
+        measure_partner_client_startup as measure_partner_client_startup,
+    )
 def resolve_worker_model(raw_model: Optional[str] = None, task_item: Any = None) -> str:
     """
     Resolves the worker model for a task, respecting per-task overrides in task_item,
     explicit raw_model / MODEL_OVERRIDE, and resolving tier aliases ('auto', 'inherit',
-    'inherit-parent', 'flash', 'flash_lite', 'flash-lite', 'pro').
+    'inherit-parent', 'flash', 'flash_lite', 'flash-lite', 'pro', and partner models).
     """
     candidate = ""
     if (
@@ -772,12 +756,24 @@ def resolve_worker_model(raw_model: Optional[str] = None, task_item: Any = None)
         "pro": "gemini-3.1-pro",
         "flash_lite": "gemini-3.1-flash-lite",
         "flash-lite": "gemini-3.1-flash-lite",
+        "argon": "gemini-4-argon",
+        "gemini-argon": "gemini-4-argon",
+        "gemini-4": "gemini-4-argon",
+        "gemini": "gemini-3.8-flash",
+        "deepseek": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
+        "deepseek-flash": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
+        "deepseek-4.1": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
+        "deepseek-v4.1": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
+        "deepseek-4.1-flash": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
+        "deepseek-v4.1-flash-maas": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
+        "deepseek-v4.1-flash-maas@001": "publishers/deepseek-ai/models/deepseek-v4.1-flash-maas",
         "auto": default_model,
         "inherit": default_model,
         "inherit-parent": default_model,
         "inherit_parent": default_model,
         "": default_model,
     }
+    alias_map.update(PARTNER_MODEL_ALIASES)
 
     norm = candidate.lower()
     if norm in alias_map:
@@ -800,10 +796,14 @@ def execute_task(
     task_index: int = 0,
     messenger: Optional[Any] = None,
     orchestrator_timeout: float = 600.0,
+    *,
+    limits: Optional[ExecutionLimits] = None,
 ) -> Tuple[str, str]:
     task_type = "agent"
     if isinstance(task_item, dict):
         task_type = task_item.get("type", "agent")
+
+    limits = limits or limits_for_task(task_item, command_default=900 if task_type == "command" else 300)
 
     # Command execution runner
     if task_type == "command":
@@ -813,28 +813,45 @@ def execute_task(
         if not cmd_str:
             cmd_str = task_brief
 
+        emit_user_input(task_index, cmd_str)
+        emit_tool_invocation(task_index, "run_command", {"command": cmd_str})
         emit_milestone(task_index, "RUNNING_COMMAND", cmd_str)
         print(f"Executing command task: {cmd_str}", flush=True)
-        timeout = int(os.environ.get("COMMAND_TIMEOUT", "900"))
-        try:
-            res = subprocess.run(
-                cmd_str,
-                shell=True,
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            if res.returncode == 0:
-                return "PASS", res.stdout
-            else:
-                err_msg = res.stderr if res.stderr else res.stdout
-                return "ISSUES", err_msg
-        except subprocess.TimeoutExpired:
-            return "ISSUES", f"Command timed out after {timeout} seconds: {cmd_str}"
+        res, output = run_bounded_shell(cmd_str, repo_dir, limits.command_timeout_s)
+        emit_tool_result(task_index, "run_command", output, success=res.returncode == 0)
+        return ("PASS" if res.returncode == 0 else "ISSUES"), output
+
+    resolved_model = resolve_worker_model(raw_model=model_override, task_item=task_item)
+    if is_deepseek_model(resolved_model):
+        location_override = "global" if (not location or location == "us-central1" or not os.environ.get("VERTEXAI_LOCATION")) else location
+        emit_milestone(task_index, "RUNNING_AGENT", f"Vertex Model Garden agent ({resolved_model})")
+        return execute_deepseek_model_agent(
+            model=resolved_model,
+            task_brief=task_brief,
+            repo_dir=repo_dir,
+            task_item=task_item,
+            task_index=task_index,
+            project=project,
+            location=location_override,
+            messenger=messenger,
+            limits=limits,
+        )
+
+    if is_partner_model(resolved_model):
+        emit_milestone(task_index, "RUNNING_AGENT", f"Vertex Model Garden agent ({resolved_model})")
+        return execute_partner_model_agent(
+            model=resolved_model,
+            task_brief=task_brief,
+            repo_dir=repo_dir,
+            task_item=task_item,
+            task_index=task_index,
+            project=project,
+            location=location,
+            messenger=messenger,
+            limits=limits,
+        )
 
     # General Agent Execution using Google Antigravity SDK
-    resolved_model = resolve_worker_model(raw_model=model_override, task_item=task_item)
     emit_milestone(task_index, "RUNNING_AGENT", f"Antigravity SDK agent ({resolved_model})")
     try:
         import asyncio
@@ -920,12 +937,25 @@ def execute_task(
             config_kwargs.pop("hooks", None)
             config = LocalAgentConfig(**config_kwargs)
 
+        emit_user_input(task_index, task_brief)
+
         async def _run_agent_turn() -> str:
             async with Agent(config=config) as agent:
                 resp = await agent.chat(task_brief)
-                return await resp.text()
+                if hasattr(resp, "thinking") and resp.thinking:
+                    emit_thought(task_index, str(resp.thinking))
+                elif hasattr(resp, "thoughts") and resp.thoughts:
+                    emit_thought(task_index, str(resp.thoughts))
+                if hasattr(resp, "text"):
+                    res = resp.text() if callable(resp.text) else resp.text
+                    text = await res if asyncio.iscoroutine(res) else str(res)
+                else:
+                    text = str(resp)
+                emit_agent_response(task_index, text)
+                return text
 
-        agent_text = asyncio.run(_run_agent_turn())
+        with TokenShield(task_index=task_index):
+            agent_text = asyncio.run(_run_agent_turn())
         return evaluate_agent_status(agent_text)
     except ImportError:
         return "BLOCKED", "Missing dependency: google.antigravity Python package is not installed."
@@ -957,16 +987,6 @@ def main() -> None:
     if not gh_token:
         print("Warning: Missing GH_TOKEN. Proceeding with unauthenticated git operations.", file=sys.stderr)
 
-    use_vertex = os.environ.get("USE_VERTEX_AI", "").lower() in ("1", "true", "yes")
-    gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not use_vertex and not gemini_api_key:
-        emit_milestone(task_index, "COMPLETE", "BLOCKED")
-        print(
-            "[STATUS: BLOCKED]\nEvidence: Missing authentication. Neither USE_VERTEX_AI nor GEMINI_API_KEY is provided.\nSummary: Authentication configuration error.",
-            flush=True,
-        )
-        sys.exit(1)
-
     project = os.environ.get("VERTEXAI_PROJECT") or os.environ.get("GCP_PROJECT") or os.environ.get("PROJECT_ID")
     location = os.environ.get("VERTEXAI_LOCATION") or os.environ.get("GCP_REGION") or os.environ.get("REGION")
     model_override = os.environ.get("MODEL_OVERRIDE", "")
@@ -981,6 +1001,25 @@ def main() -> None:
         emit_milestone(task_index, "COMPLETE", "BLOCKED")
         print(
             f"[STATUS: BLOCKED]\nEvidence: Failed to parse task brief for index {task_index}: {exc}\nSummary: Manifest resolution failure.",
+            flush=True,
+        )
+        sys.exit(1)
+
+    limits = limits_for_task(task_item, command_default=900 if isinstance(task_item, dict) and task_item.get("type") == "command" else 300)
+
+    task_model = resolve_worker_model(raw_model=model_override, task_item=task_item)
+    use_vertex = (
+        os.environ.get("USE_VERTEX_AI", "").lower() in ("1", "true", "yes")
+        or bool(os.environ.get("VERTEXAI_PROJECT"))
+        or bool(os.environ.get("GCP_PROJECT"))
+        or is_partner_model(task_model)
+        or is_deepseek_model(task_model)
+    )
+    gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not use_vertex and not gemini_api_key:
+        emit_milestone(task_index, "COMPLETE", "BLOCKED")
+        print(
+            "[STATUS: BLOCKED]\nEvidence: Missing authentication. Neither USE_VERTEX_AI nor GEMINI_API_KEY is provided.\nSummary: Authentication configuration error.",
             flush=True,
         )
         sys.exit(1)
@@ -1081,22 +1120,11 @@ def main() -> None:
         task_index=task_index,
         messenger=messenger,
         orchestrator_timeout=orchestrator_timeout,
+        limits=limits,
     )
 
-    if agent_status == "BLOCKED":
-        emit_milestone(task_index, "COMPLETE", "BLOCKED")
-        print("=" * 80)
-        print("[STATUS: BLOCKED]")
-        print("Evidence:")
-        print(f"- Task Index: {task_index}")
-        print(f"- Branch: {branch_name}")
-        print("- Commit SHA: N/A")
-        print("- Changes Pushed: False")
-        print("- Diff Stat:\nExecution blocked before changes.")
-        print("Summary:")
-        print(agent_summary.strip())
-        print("=" * 80, flush=True)
-        sys.exit(1)
+    agent_summary = scrub_credentials(agent_summary)
+    write_diagnostic(repo_dir, "agent-result", agent_summary)
 
     score, accuracy, latency_ms = parse_score_metrics(repo_dir)
     gcs_bucket = os.environ.get("GCS_RESULTS_BUCKET", "").strip()
@@ -1146,53 +1174,38 @@ def main() -> None:
         agent_summary += f"\n[Steering Instructions Applied]: {steer_summary}"
         print(f"Notice: Applied {len(steer_messages)} steering instruction(s): {steer_summary}", flush=True)
 
-    # Prevent ghost commits: Only commit when agent_status == "PASS" and candidate files exist
-    if agent_status == "PASS" and candidate_files:
+    if agent_status == "PASS" and verify_cmd_str:
         emit_milestone(task_index, "VALIDATING_CANDIDATE")
-        if verify_cmd_str:
-            print(f"Running verification command: {verify_cmd_str}", flush=True)
-            verify_timeout = int(os.environ.get("VERIFY_TIMEOUT", "300"))
-            try:
-                test_check = subprocess.run(
-                    verify_cmd_str,
-                    shell=True,
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=verify_timeout,
-                )
-                if test_check.returncode != 0:
-                    agent_status = "ISSUES"
-                    err_snippet = (test_check.stderr.strip() or test_check.stdout.strip())[-500:]
-                    diff_stat = f"Commit rejected: Candidate failed verification command (exit code {test_check.returncode}): {err_snippet}"
-                    print(f"Warning: Candidate modifications failed verification command (exit code {test_check.returncode}). Commit blocked.", file=sys.stderr)
-            except subprocess.TimeoutExpired:
-                agent_status = "ISSUES"
-                diff_stat = f"Commit rejected: Candidate verification command timed out after {verify_timeout}s."
-                print(f"Warning: Candidate verification command timed out after {verify_timeout}s. Commit blocked.", file=sys.stderr)
+        test_check, verify_output = run_bounded_shell(
+            verify_cmd_str, repo_dir, limits.verify_timeout_s, label="verification",
+        )
+        agent_summary += f"\nVerification:\n{verify_output}"
+        if test_check.returncode != 0:
+            agent_status = "ISSUES"
+            diff_stat = f"Commit rejected: Candidate failed verification command (exit code {test_check.returncode})."
 
-        if agent_status == "PASS":
-            try:
-                for cand_file in candidate_files:
-                    run_command(["git", "add", "--", cand_file], cwd=repo_dir, check=True)
-                cached_diff = run_command(["git", "diff", "--cached", "--name-only"], cwd=repo_dir, check=False)
-                if not cached_diff.stdout.strip():
-                    diff_stat = "Commit skipped: No candidate changes staged."
-                    print("Notice: No candidate changes staged; skipping git commit.", file=sys.stderr)
-                else:
-                    commit_msg = f"worker-{task_index}: execute swarm brief"
-                    run_command(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=True)
-                    commit_res = run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True)
-                    commit_sha = commit_res.stdout.strip()
-                    diff_res = run_command(["git", "diff", "--stat", "HEAD~1", "HEAD"], cwd=repo_dir, check=False)
-                    diff_stat = diff_res.stdout.strip()
-            except subprocess.CalledProcessError as exc:
-                agent_status = "ISSUES"
-                commit_sha = None
-                err_text = (exc.stderr or str(exc)).strip()
-                diff_stat = f"Commit failed: {err_text}"
-                err_msg = exc.stderr.replace(gh_token, "REDACTED") if gh_token and gh_token in exc.stderr else err_text
-                print(f"Warning: Git commit preparation failed: {err_msg}", file=sys.stderr)
+    if agent_status == "PASS" and candidate_files:
+        try:
+            for cand_file in candidate_files:
+                run_command(["git", "add", "--", cand_file], cwd=repo_dir, check=True)
+            cached_diff = run_command(["git", "diff", "--cached", "--name-only"], cwd=repo_dir, check=False)
+            if not cached_diff.stdout.strip():
+                diff_stat = "Commit skipped: No candidate changes staged."
+                print("Notice: No candidate changes staged; skipping git commit.", file=sys.stderr)
+            else:
+                commit_msg = f"worker-{task_index}: execute swarm brief"
+                run_command(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=True)
+                commit_res = run_command(["git", "rev-parse", "HEAD"], cwd=repo_dir, check=True)
+                commit_sha = commit_res.stdout.strip()
+                diff_res = run_command(["git", "diff", "--stat", "HEAD~1", "HEAD"], cwd=repo_dir, check=False)
+                diff_stat = diff_res.stdout.strip()
+        except subprocess.CalledProcessError as exc:
+            agent_status = "ISSUES"
+            commit_sha = None
+            err_text = (exc.stderr or str(exc)).strip()
+            diff_stat = f"Commit failed: {err_text}"
+            err_msg = exc.stderr.replace(gh_token, "REDACTED") if gh_token and gh_token in exc.stderr else err_text
+            print(f"Warning: Git commit preparation failed: {err_msg}", file=sys.stderr)
     elif agent_status != "PASS":
         diff_stat = f"Commit skipped: worker status is {agent_status} (PASS required; ghost commits prohibited)."
         print(f"Notice: Agent status is {agent_status}. Skipping git commit.", file=sys.stderr)
@@ -1240,6 +1253,7 @@ def main() -> None:
                 status=final_status,
                 candidate_files=candidate_files,
                 commit_sha=commit_sha,
+                evidence_files=task_item.get("evidence_files", []) if isinstance(task_item, dict) else [],
             )
             if gcs_uris:
                 emit_milestone(task_index, "ARTIFACTS_UPLOADED")
@@ -1257,11 +1271,8 @@ def main() -> None:
             except Exception:
                 pass
 
-        # Fail-closed check: if final_status == "PASS" and candidate_files were modified,
-        # but upload_run_artifacts() failed to upload patch.diff or status.json to GCS,
-        # or if upload explicitly failed, override final_status = "ISSUES".
-        if final_status == "PASS" and candidate_files:
-            if upload_failed or "patch.diff" not in gcs_uris or "status.json" not in gcs_uris:
+        if final_status == "PASS":
+            if upload_failed or "status.json" not in gcs_uris or (candidate_files and "patch.diff" not in gcs_uris):
                 final_status = "ISSUES"
                 fail_evidence = "Artifact upload to GCS failed; candidate patch could not be preserved."
                 agent_summary += f"\n{fail_evidence}"
@@ -1276,7 +1287,6 @@ def main() -> None:
 
     emit_milestone(task_index, "COMPLETE", final_status)
     print("=" * 80)
-    print(f"[STATUS: {final_status}]")
     print("Evidence:")
     print(f"- Task Index: {task_index}")
     print(f"- Branch: {branch_name}")
@@ -1305,8 +1315,12 @@ def main() -> None:
         print(f"- GCS Score: {gcs_uris['score.json']}")
     print(f"- Diff Stat:\n{diff_stat}")
     print("Summary:")
-    print(agent_summary.strip())
-    print("=" * 80, flush=True)
+    for summary_line in agent_summary.strip().splitlines():
+        print(f"> {summary_line}")
+    print("=" * 80)
+    print(f"[STATUS: {final_status}]", flush=True)
+    if final_status != "PASS":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

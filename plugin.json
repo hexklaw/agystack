@@ -1,14 +1,17 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agystack",
-  "version": "0.15.0",
-  "description": "agystack for Antigravity IDE. Rigorous agent workflows: poteto-mode, how, why, architect, arena, swarm, interrogate, deslop. Port of Lauren Tan's pstack for Antigravity.",
+  "displayName": "agystack",
+  "version": "0.16.0",
+  "description": "Rigorous agentic engineering framework for Google Antigravity: poteto-mode, playbooks, isolated subagents, adversarial reviews, and cloud swarms. Spinoff of poteto's pstack.",
   "author": {
-    "name": "Lauren Tan (original pstack), Antigravity port"
+    "name": "Joel Taroreh",
+    "url": "https://github.com/jtaroreh/agystack"
   },
   "homepage": "https://github.com/jtaroreh/agystack",
   "repository": "https://github.com/jtaroreh/agystack",
   "license": "MIT",
+  "logo": "assets/logo.svg",
   "keywords": [
     "agystack",
     "pstack",
@@ -19,5 +22,10 @@
     "subagents",
     "unslop",
     "deslop"
+  ],
+  "suggestedPrompts": [
+    "/agystack plan and implement this feature",
+    "/interrogate this implementation with multi-model adversarial reviews",
+    "/create-verification-skill for this project"
   ]
 }
